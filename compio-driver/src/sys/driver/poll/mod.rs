@@ -123,7 +123,7 @@ impl FdQueue {
 
 /// Low-level driver of polling.
 pub(crate) struct Driver {
-    events: Events,
+    events: Option<Events>,
     notify: Arc<Notify>,
     registry: HashMap<RawFd, FdQueue>,
     pool: AsyncifyPool,
@@ -146,7 +146,7 @@ impl Driver {
         let (completed_tx, completed_rx) = flume::unbounded();
 
         Ok(Self {
-            events,
+            events: Some(events),
             notify,
             registry: HashMap::new(),
             pool: builder.create_or_get_thread_pool(),
@@ -171,11 +171,28 @@ impl Driver {
     where
         F: FnOnce(&mut Self, &mut Events) -> R,
     {
-        let mut events = std::mem::take(&mut self.events);
-        let res = f(self, &mut events);
+        struct EventsGuard<'a> {
+            driver: &'a mut Driver,
+            events: Option<Events>,
+        }
+
+        impl Drop for EventsGuard<'_> {
+            fn drop(&mut self) {
+                self.driver.events = self.events.take();
+            }
+        }
+
+        let events = self.events.take().expect("event storage is present");
+        let mut guard = EventsGuard {
+            driver: self,
+            events: Some(events),
+        };
+        let res = f(
+            guard.driver,
+            guard.events.as_mut().expect("event storage is present"),
+        );
         // Clear the notification state to avoid empty loops.
-        self.notify.set_awake();
-        self.events = events;
+        guard.driver.notify.set_awake();
         res
     }
 
@@ -372,7 +389,8 @@ impl Driver {
     fn push_blocking(&mut self, key: ErasedKey) {
         let waker = self.waker();
         let completed = self.completed_tx.clone();
-        // SAFETY: we're submitting into the driver, so it's safe to freeze here.
+        // SAFETY: we're submitting into the driver, so it's safe to freeze
+        // here.
         let mut key = unsafe { key.freeze() };
 
         let mut closure = move || {
@@ -450,12 +468,13 @@ impl Driver {
         if !need_wait || has_completed {
             timeout = Some(Duration::ZERO);
         }
-        // We need to poll the poller first to make sure it handles the internal notify
-        // event (if any).
-        self.events.clear();
-        self.notify.poll.wait(&mut self.events, timeout)?;
+        // We need to poll the poller first to make sure it handles the internal
+        // notify event (if any).
+        let events = self.events.as_mut().expect("event storage is present");
+        events.clear();
+        self.notify.poll.wait(events, timeout)?;
         self.notify.set_awake();
-        if self.events.is_empty() {
+        if events.is_empty() {
             if self.poll_completed() {
                 return Ok(());
             }
@@ -474,8 +493,9 @@ impl Driver {
                 let op_type = op.carrier.op_type();
                 match op_type {
                     None => {
-                        // On epoll, multiple event may be received even if it is registered as
-                        // one-shot. It is safe to ignore it.
+                        // On epoll, multiple event may be received even if it
+                        // is registered as one-shot. It
+                        // is safe to ignore it.
                         trace!("op {} is completed", event.key);
                     }
                     Some(OpType::Fd(_)) => {
@@ -575,5 +595,51 @@ impl Wake for Notify {
         if !self.awake.wake() {
             self.poll.notify().ok();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn driver() -> Driver {
+        Driver::new(ProactorBuilder::new().capacity(7)).unwrap()
+    }
+
+    fn assert_reusable(driver: &mut Driver) {
+        assert_eq!(driver.events.as_ref().unwrap().capacity().get(), 7);
+        driver.waker().wake_by_ref();
+        driver.poll(None).unwrap();
+        assert_eq!(driver.events.as_ref().unwrap().capacity().get(), 7);
+    }
+
+    #[test]
+    fn events_returned_after_success() {
+        let mut driver = driver();
+        let value = driver.with_events(|_, events| {
+            assert_eq!(events.capacity().get(), 7);
+            42
+        });
+        assert_eq!(value, 42);
+        assert_reusable(&mut driver);
+    }
+
+    #[test]
+    fn events_returned_after_error() {
+        let mut driver = driver();
+        let result: io::Result<()> =
+            driver.with_events(|_, _| Err(io::Error::from(io::ErrorKind::Interrupted)));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert_reusable(&mut driver);
+    }
+
+    #[test]
+    fn events_returned_after_panic() {
+        let mut driver = driver();
+        let panic = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            driver.with_events(|_, _| panic!("event processing failed"));
+        }));
+        assert!(panic.is_err());
+        assert_reusable(&mut driver);
     }
 }
